@@ -191,6 +191,7 @@ enum cpole1_capacitor { CPOLE1_0_PF = 0, CPOLE1_8_PF, CPOLE1_16_PF, CPOLE1_24_PF
 
 /* Default return code for mock driver functions (0 = success) */
 extern int mock_adf4382_init_retval;
+extern int mock_adf4382_set_timed_sync_retval;
 extern int mock_ad9523_setup_retval;
 
 /* ========================= ADF4382 mock API ======================= */

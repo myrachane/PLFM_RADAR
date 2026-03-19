@@ -92,9 +92,9 @@ test_bug2_ad9523_double_setup: test_bug2_ad9523_double_setup.c $(MOCK_OBJS)
 test_bug6_timer_variable_collision: test_bug6_timer_variable_collision.c $(MOCK_OBJS)
 	$(CC) $(CFLAGS) $(INCLUDES) $< $(MOCK_OBJS) -o $@
 
-# Bug 7 and 8 don't even need mock objects — pure static analysis
-test_bug7_gpio_pin_conflict: test_bug7_gpio_pin_conflict.c
-	$(CC) $(CFLAGS) -I. $< -o $@
+# Bug 7 needs shim headers + mock objects (post-fix test includes shim adf4382a_manager.h)
+test_bug7_gpio_pin_conflict: test_bug7_gpio_pin_conflict.c $(MOCK_OBJS)
+	$(CC) $(CFLAGS) $(INCLUDES) $< $(MOCK_OBJS) -o $@
 
 test_bug8_uart_commented_out: test_bug8_uart_commented_out.c
 	$(CC) $(CFLAGS) -I. $< -o $@

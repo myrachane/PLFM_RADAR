@@ -7,10 +7,16 @@
 // External SPI handle
 extern SPI_HandleTypeDef hspi4;
 
+// External timer for DELADJ PWM (configured in CubeMX, period = DELADJ_MAX_DUTY_CYCLE)
+// TX DELADJ uses TIM3_CH2, RX DELADJ uses TIM3_CH3
+extern TIM_HandleTypeDef htim3;
+
 // Static function prototypes
 static void set_chip_enable(uint8_t ce_pin, bool state);
 static void set_deladj_pin(uint8_t device, bool state);
 static void set_delstr_pin(uint8_t device, bool state);
+static void start_deladj_pwm(uint8_t device, uint16_t duty_cycle);
+static void stop_deladj_pwm(uint8_t device);
 static uint16_t phase_ps_to_duty_cycle(uint16_t phase_ps);
 
 int ADF4382A_Manager_Init(ADF4382A_Manager *manager, SyncMethod method)
@@ -163,40 +169,43 @@ int ADF4382A_Manager_Init(ADF4382A_Manager *manager, SyncMethod method)
     adf4382_set_en_chan(manager->rx_dev, 0, true);
     adf4382_set_en_chan(manager->rx_dev, 1, false);
     
+    // Mark initialized BEFORE sync setup so SetupTimedSync/SetupEZSync
+    // see initialized=true and actually configure the hardware.
+    // (FIX for Bug #1: previously this was set AFTER the sync calls,
+    //  causing them to always return -2 NOT_INIT.)
+    manager->initialized = true;
+    DIAG("LO", "manager->initialized set to true (before sync setup)");
+
     // Setup synchronization based on selected method
-    // BUG DIAGNOSTIC: At this point manager->initialized is still false.
-    // ADF4382A_SetupTimedSync() and ADF4382A_SetupEZSync() both check
-    // manager->initialized and will return -2 (NOT_INIT) if false.
-    // This means sync setup ALWAYS SILENTLY FAILS during init.
-    DIAG_WARN("LO", "About to call sync setup -- manager->initialized=%s (BUG: will fail -2 if false)",
+    DIAG("LO", "About to call sync setup -- manager->initialized=%s",
               manager->initialized ? "true" : "false");
 
     if (method == SYNC_METHOD_TIMED) {
         ret = ADF4382A_SetupTimedSync(manager);
         DIAG("LO", "ADF4382A_SetupTimedSync() returned %d", ret);
         if (ret) {
-            DIAG_ERR("LO", "Timed sync setup FAILED: %d (expected -2 due to init ordering bug)", ret);
+            DIAG_ERR("LO", "Timed sync setup FAILED: %d", ret);
             printf("Timed sync setup failed: %d\n", ret);
-            // NOTE: Error is logged but swallowed -- init continues
+            manager->initialized = false;
+            return ret;
         }
     } else {
         ret = ADF4382A_SetupEZSync(manager);
         DIAG("LO", "ADF4382A_SetupEZSync() returned %d", ret);
         if (ret) {
-            DIAG_ERR("LO", "EZSync setup FAILED: %d (expected -2 due to init ordering bug)", ret);
+            DIAG_ERR("LO", "EZSync setup FAILED: %d", ret);
             printf("EZSync setup failed: %d\n", ret);
+            manager->initialized = false;
+            return ret;
         }
     }
-    
-    manager->initialized = true;
-    DIAG("LO", "manager->initialized set to true (sync setup was called BEFORE this)");
 
     printf("ADF4382A Manager initialized with %s synchronization on SPI4\n",
            (method == SYNC_METHOD_TIMED) ? "TIMED" : "EZSYNC");
     
     DIAG_ELAPSED("LO", "Total Manager_Init", t_start);
-    DIAG("LO", "Init returning OK (but sync setup was %s)",
-         (ret == 0) ? "successful" : "FAILED -- sync NOT configured");
+    DIAG("LO", "Init returning OK (sync setup %s)",
+         (ret == 0) ? "successful" : "had warnings");
     
     return ADF4382A_MANAGER_OK;
 }
@@ -281,24 +290,56 @@ int ADF4382A_SetupEZSync(ADF4382A_Manager *manager)
 
 int ADF4382A_TriggerTimedSync(ADF4382A_Manager *manager)
 {
+    int ret;
+
     if (!manager || !manager->initialized || manager->sync_method != SYNC_METHOD_TIMED) {
         DIAG_ERR("LO", "TriggerTimedSync REJECTED: init=%s method=%d",
                  (manager && manager->initialized) ? "true" : "false",
                  manager ? manager->sync_method : -1);
         return ADF4382A_MANAGER_ERROR_NOT_INIT;
     }
-    
-    // NOTE: This function currently does NOT trigger anything -- it only prints.
-    // The assumption is that the 60 MHz SYNCP/SYNCN from AD9523 are always present
-    // and timed sync happens automatically once the timed_sync_setup registers are
-    // programmed. But if SetupTimedSync failed (init ordering bug), this is a no-op
-    // on top of a no-op.
-    DIAG_WARN("LO", "TriggerTimedSync called -- NOTE: function body is advisory only, no hardware trigger issued");
-    DIAG_WARN("LO", "If SetupTimedSync failed during init, timed sync registers were NEVER written");
 
-    printf("Timed sync ready - SYNC pin will trigger synchronization\n");
-    printf("Ensure 60 MHz phase-aligned clocks are present on SYNCP/SYNCN pins\n");
+    DIAG("LO", "Triggering timed sync via sw_sync pulse (SYNCP/SYNCN must be present)...");
 
+    // Arm the sync capture on both devices via sw_sync.
+    // With timed_sync_setup already programmed, the device will synchronize
+    // its output dividers to the next SYNCP/SYNCN rising edge after sw_sync
+    // is asserted.
+    ret = adf4382_set_sw_sync(manager->tx_dev, true);
+    if (ret) {
+        DIAG_ERR("LO", "TX timed sw_sync SET failed: %d", ret);
+        printf("TX timed sync trigger failed: %d\n", ret);
+        return ADF4382A_MANAGER_ERROR_SPI;
+    }
+
+    ret = adf4382_set_sw_sync(manager->rx_dev, true);
+    if (ret) {
+        DIAG_ERR("LO", "RX timed sw_sync SET failed: %d", ret);
+        printf("RX timed sync trigger failed: %d\n", ret);
+        return ADF4382A_MANAGER_ERROR_SPI;
+    }
+
+    // Wait for at least one sync clock cycle (60 MHz = 16.7 ns period).
+    // 10 us is conservative — guarantees multiple sync edges are captured.
+    no_os_udelay(10);
+
+    // De-assert sw_sync
+    ret = adf4382_set_sw_sync(manager->tx_dev, false);
+    if (ret) {
+        DIAG_ERR("LO", "TX timed sw_sync CLEAR failed: %d", ret);
+        printf("TX timed sync clear failed: %d\n", ret);
+        return ADF4382A_MANAGER_ERROR_SPI;
+    }
+
+    ret = adf4382_set_sw_sync(manager->rx_dev, false);
+    if (ret) {
+        DIAG_ERR("LO", "RX timed sw_sync CLEAR failed: %d", ret);
+        printf("RX timed sync clear failed: %d\n", ret);
+        return ADF4382A_MANAGER_ERROR_SPI;
+    }
+
+    printf("Timed sync triggered via sw_sync pulse\n");
+    DIAG("LO", "Timed sync trigger complete (sw_sync set + 10us + clear)");
     return ADF4382A_MANAGER_OK;
 }
 
@@ -564,22 +605,24 @@ int ADF4382A_SetFinePhaseShift(ADF4382A_Manager *manager, uint8_t device, uint16
     // Clamp duty cycle
     duty_cycle = (duty_cycle > DELADJ_MAX_DUTY_CYCLE) ? DELADJ_MAX_DUTY_CYCLE : duty_cycle;
 
-    // For simplicity, we'll use a basic implementation
-    // In a real system, you would generate a PWM signal on DELADJ pin
-    // Here we just set the pin state based on a simplified approach
-
     if (duty_cycle == 0) {
+        // Fully OFF: stop PWM, drive pin LOW
+        stop_deladj_pwm(device);
         set_deladj_pin(device, false);
-        DIAG("LO", "Dev%d DELADJ=LOW (duty=0)", device);
+        DIAG("LO", "Dev%d DELADJ=LOW (duty=0, PWM stopped)", device);
     } else if (duty_cycle >= DELADJ_MAX_DUTY_CYCLE) {
+        // Fully ON: stop PWM, drive pin HIGH
+        stop_deladj_pwm(device);
         set_deladj_pin(device, true);
-        DIAG("LO", "Dev%d DELADJ=HIGH (duty=max)", device);
+        DIAG("LO", "Dev%d DELADJ=HIGH (duty=max, PWM stopped)", device);
     } else {
-        // For intermediate values, you would need PWM generation
-        // This is a simplified implementation
-        set_deladj_pin(device, true);
-        DIAG_WARN("LO", "Dev%d DELADJ=HIGH for duty=%d/%d -- PLACEHOLDER: intermediate values need real PWM",
-                  device, duty_cycle, DELADJ_MAX_DUTY_CYCLE);
+        // Intermediate: use TIM3 PWM output
+        // The PWM output is low-pass filtered externally to produce a DC
+        // voltage proportional to the duty cycle for the ADF4382 DELADJ input.
+        start_deladj_pwm(device, duty_cycle);
+        DIAG("LO", "Dev%d DELADJ PWM started: duty=%d/%d (%.1f%%)",
+             device, duty_cycle, DELADJ_MAX_DUTY_CYCLE,
+             (float)duty_cycle * 100.0f / DELADJ_MAX_DUTY_CYCLE);
     }
 
     printf("Device %d DELADJ duty cycle set to %d/%d\n",
@@ -630,6 +673,21 @@ static void set_delstr_pin(uint8_t device, bool state)
     } else { // RX device
         HAL_GPIO_WritePin(RX_DELSTR_GPIO_Port, RX_DELSTR_Pin, state ? GPIO_PIN_SET : GPIO_PIN_RESET);
     }
+}
+
+static void start_deladj_pwm(uint8_t device, uint16_t duty_cycle)
+{
+    // TX DELADJ → TIM3_CH2, RX DELADJ → TIM3_CH3
+    // Timer period (ARR) is configured to DELADJ_MAX_DUTY_CYCLE in CubeMX.
+    uint32_t channel = (device == 0) ? TIM_CHANNEL_2 : TIM_CHANNEL_3;
+    __HAL_TIM_SET_COMPARE(&htim3, channel, (uint32_t)duty_cycle);
+    HAL_TIM_PWM_Start(&htim3, channel);
+}
+
+static void stop_deladj_pwm(uint8_t device)
+{
+    uint32_t channel = (device == 0) ? TIM_CHANNEL_2 : TIM_CHANNEL_3;
+    HAL_TIM_PWM_Stop(&htim3, channel);
 }
 
 static uint16_t phase_ps_to_duty_cycle(uint16_t phase_ps)

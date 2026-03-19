@@ -954,8 +954,7 @@ void getSystemStatusForGUI(char* status_buffer, size_t buffer_size) {
     status_buffer[buffer_size - 1] = '\0';
 }
 
-/* ---------- UART printing helpers ---------- */
-/*
+/* ---------- UART printing helpers (Bug #8 FIXED: uncommented) ---------- */
 static void uart_print(const char *msg)
 {
     HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
@@ -967,7 +966,6 @@ static void uart_println(const char *msg)
     const char crlf[] = "\r\n";
     HAL_UART_Transmit(&huart3, (uint8_t*)crlf, 2, HAL_MAX_DELAY);
 }
-*/
 
 /* ---------- Helper delay wrappers ---------- */
 static inline void delay_ms(uint32_t ms) { HAL_Delay(ms); }
@@ -1133,15 +1131,9 @@ static int configure_ad9523(void)
     DIAG("CLK", "Calling ad9523_init() -- fills pdata defaults");
     ad9523_init(&init_param);
 
-    /* [BUG ANNOTATION] First ad9523_setup() call -- chip is still in reset
-     * (AD9523_RESET_RELEASE() hasn't been called yet).
-     * SPI writes here likely fail silently or go to a reset device. */
-    DIAG_WARN("CLK", "[BUG] Calling ad9523_setup() #1 BEFORE reset release -- chip in reset, writes likely lost");
-    uint32_t setup1_start = HAL_GetTick();
-    ret = ad9523_setup(&dev, &init_param);
-    DIAG("CLK", "ad9523_setup() #1 returned %ld (took %lu ms)",
-         (long)ret, (unsigned long)(HAL_GetTick() - setup1_start));
-
+    /* [Bug #2 FIXED] Removed first ad9523_setup() call that was here.
+     * It wrote to the chip while still in reset — writes were lost.
+     * Only the post-reset setup call below is needed. */
 
     // Bring AD9523 out of reset
     DIAG("CLK", "Releasing AD9523 reset (AD9523_RESET_RELEASE)");
@@ -1154,14 +1146,14 @@ static int configure_ad9523(void)
     AD9523_REF_SEL(true);
 
     // Call setup which uses no_os_spi to write registers, io_update, calibrate, sync
-    DIAG("CLK", "Calling ad9523_setup() #2 -- post-reset, actual configuration");
-    uint32_t setup2_start = HAL_GetTick();
+    DIAG("CLK", "Calling ad9523_setup() -- post-reset configuration");
+    uint32_t setup_start = HAL_GetTick();
     ret = ad9523_setup(&dev, &init_param);
-    DIAG("CLK", "ad9523_setup() #2 returned %ld (took %lu ms)",
-         (long)ret, (unsigned long)(HAL_GetTick() - setup2_start));
+    DIAG("CLK", "ad9523_setup() returned %ld (took %lu ms)",
+         (long)ret, (unsigned long)(HAL_GetTick() - setup_start));
     if (ret != 0) {
         // handle error: lock missing or SPI error
-        DIAG_ERR("CLK", "ad9523_setup() #2 FAILED (ret=%ld) -- lock missing or SPI error", (long)ret);
+        DIAG_ERR("CLK", "ad9523_setup() FAILED (ret=%ld) -- lock missing or SPI error", (long)ret);
         return -1;
     }
 
@@ -1553,10 +1545,14 @@ int main(void)
     DIAG("LO", "ADF4382A_Manager_Init returned %d (took %lu ms)",
          ret, (unsigned long)(HAL_GetTick() - lo_init_start));
 
-    /* [BUG ANNOTATION] The following SetPhaseShift/StrobePhaseShift calls happen
-     * BEFORE the init return code is checked (line below with 'if ret !=').
-     * If init failed, these operate on an uninitialized manager. */
-    DIAG_WARN("LO", "[BUG] SetPhaseShift/Strobe called BEFORE checking init return code (ret=%d)", ret);
+    /* [Bug #4 FIXED] Check init return code BEFORE calling phase shift.
+     * Previously SetPhaseShift/Strobe were called before this check. */
+    if (ret != ADF4382A_MANAGER_OK) {
+        printf("LO Manager initialization failed: %d\n", ret);
+        DIAG_ERR("LO", "Manager init FAILED (ret=%d) -- calling Error_Handler()", ret);
+        Error_Handler();
+    }
+
     // Set phase shift (e.g., 500 ps for TX, 500 ps for RX)
     int ps_ret = ADF4382A_SetPhaseShift(&lo_manager, 500, 500);
     DIAG("LO", "ADF4382A_SetPhaseShift(500, 500) returned %d", ps_ret);
@@ -1565,12 +1561,6 @@ int main(void)
     int strobe_tx_ret = ADF4382A_StrobePhaseShift(&lo_manager, 0); // TX device
     int strobe_rx_ret = ADF4382A_StrobePhaseShift(&lo_manager, 1); // RX device
     DIAG("LO", "StrobePhaseShift TX returned %d, RX returned %d", strobe_tx_ret, strobe_rx_ret);
-
-    if (ret != ADF4382A_MANAGER_OK) {
-        printf("LO Manager initialization failed: %d\n", ret);
-        DIAG_ERR("LO", "Manager init FAILED (ret=%d) -- calling Error_Handler()", ret);
-        Error_Handler();
-    }
 
     // Check initial lock status
     bool tx_locked, rx_locked;
@@ -2031,11 +2021,9 @@ int main(void)
 		  }
 
 
-		  /* [BUG ANNOTATION] Line below writes to 'last_check' instead of 'last_check1'.
-		   * This causes the temperature timer to share state with the lock-check timer above.
-		   * Temperature reads may run at incorrect intervals. */
-		  DIAG_WARN("PA", "[BUG] Timer uses 'last_check' instead of 'last_check1' -- temp interval corrupted");
-		  last_check = HAL_GetTick();
+		  /* [BUG #6 FIXED] Was 'last_check' — now correctly writes 'last_check1'
+		   * so the temperature timer runs independently of the lock-check timer. */
+		  last_check1 = HAL_GetTick();
 		  }
 	  //////////////////////////////////////////////////////////////////////////////////////
 	  /////////////////////////////////////ADAR1000/////////////////////////////////////////

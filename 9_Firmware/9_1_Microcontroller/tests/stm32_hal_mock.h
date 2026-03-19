@@ -102,6 +102,7 @@ extern SPI_HandleTypeDef  hspi1, hspi4;
 extern I2C_HandleTypeDef  hi2c1, hi2c2;
 extern UART_HandleTypeDef huart3;
 extern ADC_HandleTypeDef  hadc3;
+extern TIM_HandleTypeDef  htim3;  /* Timer for DELADJ PWM */
 
 /* ========================= SPY / RECORDING LAYER ================== */
 
@@ -129,6 +130,9 @@ typedef enum {
     SPY_AD9523_REMOVE,
     SPY_NO_OS_UDELAY,
     SPY_ADS7830_MEASURE,
+    SPY_TIM_PWM_START,
+    SPY_TIM_PWM_STOP,
+    SPY_TIM_SET_COMPARE,
 } SpyCallType;
 
 typedef struct {
@@ -182,6 +186,21 @@ HAL_StatusTypeDef HAL_UART_Transmit(UART_HandleTypeDef *huart, uint8_t *pData, u
 
 void no_os_udelay(uint32_t usecs);
 void no_os_mdelay(uint32_t msecs);
+
+/* ========================= TIM / PWM stubs ======================== */
+
+#define TIM_CHANNEL_1  0x00U
+#define TIM_CHANNEL_2  0x04U
+#define TIM_CHANNEL_3  0x08U
+#define TIM_CHANNEL_4  0x0CU
+
+HAL_StatusTypeDef HAL_TIM_PWM_Start(TIM_HandleTypeDef *htim, uint32_t Channel);
+HAL_StatusTypeDef HAL_TIM_PWM_Stop(TIM_HandleTypeDef *htim, uint32_t Channel);
+void mock_tim_set_compare(TIM_HandleTypeDef *htim, uint32_t Channel, uint32_t Compare);
+
+/* Macro form that the real STM32 HAL uses */
+#define __HAL_TIM_SET_COMPARE(__HANDLE__, __CHANNEL__, __COMPARE__) \
+    mock_tim_set_compare((__HANDLE__), (__CHANNEL__), (__COMPARE__))
 
 /* ========================= ADS7830 stub =========================== */
 

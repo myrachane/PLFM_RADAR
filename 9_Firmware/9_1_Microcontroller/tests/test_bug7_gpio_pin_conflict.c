@@ -1,122 +1,155 @@
 /*******************************************************************************
  * test_bug7_gpio_pin_conflict.c
  *
- * Bug #7: adf4382a_manager.h defines GPIOG pins 0-9 for ADF4382 signals,
- * but main.h (CubeMX-generated) assigns:
+ * Bug #7 (FIXED): adf4382a_manager.h previously defined GPIOG pins 0-9 for
+ * ADF4382 signals, conflicting with CubeMX main.h which assigns:
  *   - GPIOG pins 0-5 → PA enables + clock enables
- *   - GPIOG pins 6-15 → ADF4382 signals (DIFFERENT pin assignments)
+ *   - GPIOG pins 6-15 → ADF4382 signals
  *
- * The .c file uses the manager.h pin mapping, meaning it will toggle PA
- * enables and clock enables instead of the intended ADF4382 pins.
+ * The fix updated manager.h pin definitions to match CubeMX:
+ *   RX: LKDET=PIN_6, DELADJ=PIN_7, DELSTR=PIN_8, CE=PIN_9, CS=PIN_10
+ *   TX: LKDET=PIN_11, DELSTR=PIN_12, DELADJ=PIN_13, CS=PIN_14, CE=PIN_15
  *
- * Example conflicts:
- *   manager.h: TX_CE_Pin = GPIO_PIN_0       main.h: EN_P_5V0_PA1_Pin = GPIO_PIN_0
- *   manager.h: TX_CS_Pin = GPIO_PIN_1       main.h: EN_P_5V0_PA2_Pin = GPIO_PIN_1
- *   manager.h: TX_DELADJ_Pin = GPIO_PIN_2   main.h: EN_P_5V0_PA3_Pin = GPIO_PIN_2
- *   manager.h: TX_DELSTR_Pin = GPIO_PIN_3   main.h: EN_P_5V5_PA_Pin  = GPIO_PIN_3
- *   manager.h: TX_LKDET_Pin = GPIO_PIN_4    main.h: EN_P_1V8_CLOCK_Pin = GPIO_PIN_4
- *   manager.h: RX_CE_Pin = GPIO_PIN_5       main.h: EN_P_3V3_CLOCK_Pin = GPIO_PIN_5
- *
- * And for the actual ADF4382 pins:
- *   main.h: ADF4382_TX_CE_Pin = GPIO_PIN_15 vs manager.h: TX_CE_Pin = GPIO_PIN_0
- *   main.h: ADF4382_TX_CS_Pin = GPIO_PIN_14 vs manager.h: TX_CS_Pin = GPIO_PIN_1
- *
- * Test strategy:
- *   Use compile-time assertions to verify the pin conflicts exist.
- *   Then use runtime checks to demonstrate the specific collisions.
+ * Test strategy (post-fix):
+ *   1. Verify each manager.h pin definition matches the CubeMX-correct value.
+ *   2. Verify NO manager.h pin overlaps with PA/clock enable pins (0-5).
+ *   3. Verify all manager.h pins are in the GPIOG 6-15 range.
  ******************************************************************************/
 #include <assert.h>
 #include <stdio.h>
 #include <stdint.h>
 
-/* We need to manually define the pins from BOTH headers since the shim
- * main.h already has the CubeMX definitions, and including adf4382a_manager.h
- * would re-define them (which is exactly the production bug). */
+#include "stm32_hal_mock.h"
+#include "adf4382a_manager.h"
 
-/* ---- Pin definitions from adf4382a_manager.h ---- */
-#define MGR_TX_CE_Pin        ((uint16_t)0x0001)  /* GPIO_PIN_0 */
-#define MGR_TX_CS_Pin        ((uint16_t)0x0002)  /* GPIO_PIN_1 */
-#define MGR_TX_DELADJ_Pin    ((uint16_t)0x0004)  /* GPIO_PIN_2 */
-#define MGR_TX_DELSTR_Pin    ((uint16_t)0x0008)  /* GPIO_PIN_3 */
-#define MGR_TX_LKDET_Pin     ((uint16_t)0x0010)  /* GPIO_PIN_4 */
-#define MGR_RX_CE_Pin        ((uint16_t)0x0020)  /* GPIO_PIN_5 */
-#define MGR_RX_CS_Pin        ((uint16_t)0x0040)  /* GPIO_PIN_6 */
-#define MGR_RX_DELADJ_Pin    ((uint16_t)0x0080)  /* GPIO_PIN_7 */
-#define MGR_RX_DELSTR_Pin    ((uint16_t)0x0100)  /* GPIO_PIN_8 */
-#define MGR_RX_LKDET_Pin     ((uint16_t)0x0200)  /* GPIO_PIN_9 */
+/* ---- CubeMX-correct pin definitions from main.h ---- */
+#define CUBEMX_ADF4382_RX_LKDET_Pin   GPIO_PIN_6
+#define CUBEMX_ADF4382_RX_DELADJ_Pin  GPIO_PIN_7
+#define CUBEMX_ADF4382_RX_DELSTR_Pin  GPIO_PIN_8
+#define CUBEMX_ADF4382_RX_CE_Pin      GPIO_PIN_9
+#define CUBEMX_ADF4382_RX_CS_Pin      GPIO_PIN_10
 
-/* ---- Pin definitions from main.h (CubeMX) ---- */
-#define MAIN_EN_P_5V0_PA1_Pin     ((uint16_t)0x0001)  /* GPIO_PIN_0 — GPIOG */
-#define MAIN_EN_P_5V0_PA2_Pin     ((uint16_t)0x0002)  /* GPIO_PIN_1 — GPIOG */
-#define MAIN_EN_P_5V0_PA3_Pin     ((uint16_t)0x0004)  /* GPIO_PIN_2 — GPIOG */
-#define MAIN_EN_P_5V5_PA_Pin      ((uint16_t)0x0008)  /* GPIO_PIN_3 — GPIOG */
-#define MAIN_EN_P_1V8_CLOCK_Pin   ((uint16_t)0x0010)  /* GPIO_PIN_4 — GPIOG */
-#define MAIN_EN_P_3V3_CLOCK_Pin   ((uint16_t)0x0020)  /* GPIO_PIN_5 — GPIOG */
+#define CUBEMX_ADF4382_TX_LKDET_Pin   GPIO_PIN_11
+#define CUBEMX_ADF4382_TX_DELSTR_Pin  GPIO_PIN_12
+#define CUBEMX_ADF4382_TX_DELADJ_Pin  GPIO_PIN_13
+#define CUBEMX_ADF4382_TX_CS_Pin      GPIO_PIN_14
+#define CUBEMX_ADF4382_TX_CE_Pin      GPIO_PIN_15
 
-/* Correct ADF4382 pins from main.h */
-#define MAIN_ADF4382_TX_CE_Pin    ((uint16_t)0x8000)  /* GPIO_PIN_15 */
-#define MAIN_ADF4382_TX_CS_Pin    ((uint16_t)0x4000)  /* GPIO_PIN_14 */
-#define MAIN_ADF4382_TX_DELADJ_Pin ((uint16_t)0x2000) /* GPIO_PIN_13 */
-#define MAIN_ADF4382_TX_DELSTR_Pin ((uint16_t)0x1000) /* GPIO_PIN_12 */
-#define MAIN_ADF4382_TX_LKDET_Pin ((uint16_t)0x0800)  /* GPIO_PIN_11 */
-#define MAIN_ADF4382_RX_CE_Pin    ((uint16_t)0x0200)  /* GPIO_PIN_9 */
-#define MAIN_ADF4382_RX_CS_Pin    ((uint16_t)0x0400)  /* GPIO_PIN_10 */
-#define MAIN_ADF4382_RX_DELADJ_Pin ((uint16_t)0x0080) /* GPIO_PIN_7 */
-#define MAIN_ADF4382_RX_DELSTR_Pin ((uint16_t)0x0100) /* GPIO_PIN_8 */
-#define MAIN_ADF4382_RX_LKDET_Pin ((uint16_t)0x0040)  /* GPIO_PIN_6 */
+/* PA/clock enable pins that must NOT be used by ADF4382 manager */
+#define PA_CLK_ENABLE_MASK  (GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_2 | \
+                             GPIO_PIN_3 | GPIO_PIN_4 | GPIO_PIN_5)
 
 int main(void)
 {
-    int conflicts = 0;
+    printf("=== Bug #7 (FIXED): GPIO pin mapping — verify CubeMX match ===\n\n");
 
-    printf("=== Bug #7: GPIO pin mapping conflict ===\n");
-    printf("\n  Checking manager.h pins vs CubeMX main.h pins (all GPIOG):\n\n");
+    /* ---- 1. Verify RX pin definitions match CubeMX ---- */
+    printf("  RX pin verification:\n");
 
-    /* ---- Conflict checks: manager.h ADF4382 pins == main.h power enables ---- */
+    printf("    RX_LKDET_Pin  = 0x%04X  expected 0x%04X (GPIO_PIN_6)  ",
+           (unsigned)RX_LKDET_Pin, (unsigned)CUBEMX_ADF4382_RX_LKDET_Pin);
+    assert(RX_LKDET_Pin == CUBEMX_ADF4382_RX_LKDET_Pin);
+    printf("OK\n");
 
-#define CHECK_CONFLICT(mgr_name, mgr_val, main_name, main_val) do {        \
-    printf("  %-20s = 0x%04X  vs  %-25s = 0x%04X", #mgr_name, mgr_val,    \
-           #main_name, main_val);                                            \
-    if ((mgr_val) == (main_val)) {                                           \
-        printf("  ** CONFLICT **\n");                                        \
-        conflicts++;                                                         \
-    } else {                                                                 \
-        printf("  (ok)\n");                                                  \
-    }                                                                        \
-} while(0)
+    printf("    RX_DELADJ_Pin = 0x%04X  expected 0x%04X (GPIO_PIN_7)  ",
+           (unsigned)RX_DELADJ_Pin, (unsigned)CUBEMX_ADF4382_RX_DELADJ_Pin);
+    assert(RX_DELADJ_Pin == CUBEMX_ADF4382_RX_DELADJ_Pin);
+    printf("OK\n");
 
-    printf("  --- manager.h TX pins collide with PA/clock enables ---\n");
-    CHECK_CONFLICT(MGR_TX_CE,     MGR_TX_CE_Pin,     MAIN_EN_P_5V0_PA1, MAIN_EN_P_5V0_PA1_Pin);
-    CHECK_CONFLICT(MGR_TX_CS,     MGR_TX_CS_Pin,     MAIN_EN_P_5V0_PA2, MAIN_EN_P_5V0_PA2_Pin);
-    CHECK_CONFLICT(MGR_TX_DELADJ, MGR_TX_DELADJ_Pin, MAIN_EN_P_5V0_PA3, MAIN_EN_P_5V0_PA3_Pin);
-    CHECK_CONFLICT(MGR_TX_DELSTR, MGR_TX_DELSTR_Pin, MAIN_EN_P_5V5_PA,  MAIN_EN_P_5V5_PA_Pin);
-    CHECK_CONFLICT(MGR_TX_LKDET,  MGR_TX_LKDET_Pin,  MAIN_EN_P_1V8_CLK, MAIN_EN_P_1V8_CLOCK_Pin);
-    CHECK_CONFLICT(MGR_RX_CE,     MGR_RX_CE_Pin,     MAIN_EN_P_3V3_CLK, MAIN_EN_P_3V3_CLOCK_Pin);
+    printf("    RX_DELSTR_Pin = 0x%04X  expected 0x%04X (GPIO_PIN_8)  ",
+           (unsigned)RX_DELSTR_Pin, (unsigned)CUBEMX_ADF4382_RX_DELSTR_Pin);
+    assert(RX_DELSTR_Pin == CUBEMX_ADF4382_RX_DELSTR_Pin);
+    printf("OK\n");
 
-    printf("\n  --- manager.h TX pins vs correct CubeMX ADF4382 TX pins ---\n");
-    CHECK_CONFLICT(MGR_TX_CE,     MGR_TX_CE_Pin,     MAIN_ADF_TX_CE,    MAIN_ADF4382_TX_CE_Pin);
-    CHECK_CONFLICT(MGR_TX_CS,     MGR_TX_CS_Pin,     MAIN_ADF_TX_CS,    MAIN_ADF4382_TX_CS_Pin);
-    CHECK_CONFLICT(MGR_TX_DELADJ, MGR_TX_DELADJ_Pin, MAIN_ADF_TX_DADJ,  MAIN_ADF4382_TX_DELADJ_Pin);
-    CHECK_CONFLICT(MGR_TX_DELSTR, MGR_TX_DELSTR_Pin, MAIN_ADF_TX_DSTR,  MAIN_ADF4382_TX_DELSTR_Pin);
-    CHECK_CONFLICT(MGR_TX_LKDET,  MGR_TX_LKDET_Pin,  MAIN_ADF_TX_LKDT,  MAIN_ADF4382_TX_LKDET_Pin);
+    printf("    RX_CE_Pin     = 0x%04X  expected 0x%04X (GPIO_PIN_9)  ",
+           (unsigned)RX_CE_Pin, (unsigned)CUBEMX_ADF4382_RX_CE_Pin);
+    assert(RX_CE_Pin == CUBEMX_ADF4382_RX_CE_Pin);
+    printf("OK\n");
 
-    printf("\n  Total pin conflicts found: %d\n", conflicts);
+    printf("    RX_CS_Pin     = 0x%04X  expected 0x%04X (GPIO_PIN_10) ",
+           (unsigned)RX_CS_Pin, (unsigned)CUBEMX_ADF4382_RX_CS_Pin);
+    assert(RX_CS_Pin == CUBEMX_ADF4382_RX_CS_Pin);
+    printf("OK\n");
 
-    /* We expect 6 conflicts (the PA/clock enable collisions) and
-     * 5 mismatches (manager.h pins != correct CubeMX ADF4382 pins) */
-    assert(conflicts >= 6);
-    printf("  PASS: At least 6 pin conflicts confirmed\n");
+    /* ---- 2. Verify TX pin definitions match CubeMX ---- */
+    printf("\n  TX pin verification:\n");
 
-    /* ---- Verify specific critical conflict: TX_CE writes to PA1 enable ---- */
-    printf("\n  Critical safety issue:\n");
-    printf("  When adf4382a_manager.c writes TX_CE_Pin (0x%04X) on GPIOG,\n",
-           MGR_TX_CE_Pin);
-    printf("  it actually toggles EN_P_5V0_PA1 (0x%04X) — the PA1 5V power enable!\n",
-           MAIN_EN_P_5V0_PA1_Pin);
-    assert(MGR_TX_CE_Pin == MAIN_EN_P_5V0_PA1_Pin);
-    printf("  PASS: Confirmed TX_CE_Pin == EN_P_5V0_PA1_Pin (0x%04X)\n",
-           MGR_TX_CE_Pin);
+    printf("    TX_LKDET_Pin  = 0x%04X  expected 0x%04X (GPIO_PIN_11) ",
+           (unsigned)TX_LKDET_Pin, (unsigned)CUBEMX_ADF4382_TX_LKDET_Pin);
+    assert(TX_LKDET_Pin == CUBEMX_ADF4382_TX_LKDET_Pin);
+    printf("OK\n");
 
-    printf("=== Bug #7: ALL TESTS PASSED ===\n\n");
+    printf("    TX_DELSTR_Pin = 0x%04X  expected 0x%04X (GPIO_PIN_12) ",
+           (unsigned)TX_DELSTR_Pin, (unsigned)CUBEMX_ADF4382_TX_DELSTR_Pin);
+    assert(TX_DELSTR_Pin == CUBEMX_ADF4382_TX_DELSTR_Pin);
+    printf("OK\n");
+
+    printf("    TX_DELADJ_Pin = 0x%04X  expected 0x%04X (GPIO_PIN_13) ",
+           (unsigned)TX_DELADJ_Pin, (unsigned)CUBEMX_ADF4382_TX_DELADJ_Pin);
+    assert(TX_DELADJ_Pin == CUBEMX_ADF4382_TX_DELADJ_Pin);
+    printf("OK\n");
+
+    printf("    TX_CS_Pin     = 0x%04X  expected 0x%04X (GPIO_PIN_14) ",
+           (unsigned)TX_CS_Pin, (unsigned)CUBEMX_ADF4382_TX_CS_Pin);
+    assert(TX_CS_Pin == CUBEMX_ADF4382_TX_CS_Pin);
+    printf("OK\n");
+
+    printf("    TX_CE_Pin     = 0x%04X  expected 0x%04X (GPIO_PIN_15) ",
+           (unsigned)TX_CE_Pin, (unsigned)CUBEMX_ADF4382_TX_CE_Pin);
+    assert(TX_CE_Pin == CUBEMX_ADF4382_TX_CE_Pin);
+    printf("OK\n");
+
+    /* ---- 3. Verify NO overlap with PA/clock enable pins (0-5) ---- */
+    printf("\n  PA/clock enable conflict check:\n");
+
+    uint16_t all_adf_pins = RX_LKDET_Pin | RX_DELADJ_Pin | RX_DELSTR_Pin |
+                            RX_CE_Pin | RX_CS_Pin |
+                            TX_LKDET_Pin | TX_DELSTR_Pin | TX_DELADJ_Pin |
+                            TX_CS_Pin | TX_CE_Pin;
+
+    uint16_t overlap = all_adf_pins & PA_CLK_ENABLE_MASK;
+    printf("    ADF4382 pin mask:    0x%04X\n", (unsigned)all_adf_pins);
+    printf("    PA/CLK enable mask:  0x%04X\n", (unsigned)PA_CLK_ENABLE_MASK);
+    printf("    Overlap:             0x%04X  ", (unsigned)overlap);
+    assert(overlap == 0);
+    printf("OK (no conflicts)\n");
+
+    /* ---- 4. Verify all pins are unique (no two signals share a pin) ---- */
+    printf("\n  Pin uniqueness check:\n");
+    uint16_t pins[] = {
+        RX_LKDET_Pin, RX_DELADJ_Pin, RX_DELSTR_Pin, RX_CE_Pin, RX_CS_Pin,
+        TX_LKDET_Pin, TX_DELSTR_Pin, TX_DELADJ_Pin, TX_CS_Pin, TX_CE_Pin
+    };
+    const char *names[] = {
+        "RX_LKDET", "RX_DELADJ", "RX_DELSTR", "RX_CE", "RX_CS",
+        "TX_LKDET", "TX_DELSTR", "TX_DELADJ", "TX_CS", "TX_CE"
+    };
+    int n = sizeof(pins) / sizeof(pins[0]);
+    for (int i = 0; i < n; i++) {
+        for (int j = i + 1; j < n; j++) {
+            if (pins[i] == pins[j]) {
+                printf("    FAIL: %s and %s both map to 0x%04X\n",
+                       names[i], names[j], (unsigned)pins[i]);
+                assert(0 && "Duplicate pin mapping detected");
+            }
+        }
+    }
+    printf("    All 10 pins are unique  OK\n");
+
+    /* ---- 5. Verify all ports are GPIOG ---- */
+    printf("\n  Port verification:\n");
+    assert(RX_LKDET_GPIO_Port == GPIOG);
+    assert(RX_DELADJ_GPIO_Port == GPIOG);
+    assert(RX_DELSTR_GPIO_Port == GPIOG);
+    assert(RX_CE_GPIO_Port == GPIOG);
+    assert(RX_CS_GPIO_Port == GPIOG);
+    assert(TX_LKDET_GPIO_Port == GPIOG);
+    assert(TX_DELSTR_GPIO_Port == GPIOG);
+    assert(TX_DELADJ_GPIO_Port == GPIOG);
+    assert(TX_CS_GPIO_Port == GPIOG);
+    assert(TX_CE_GPIO_Port == GPIOG);
+    printf("    All pins on GPIOG  OK\n");
+
+    printf("\n=== Bug #7: ALL TESTS PASSED (post-fix) ===\n\n");
     return 0;
 }

@@ -21,6 +21,7 @@ I2C_HandleTypeDef  hi2c1 = { .id = 1 };
 I2C_HandleTypeDef  hi2c2 = { .id = 2 };
 UART_HandleTypeDef huart3 = { .id = 3 };
 ADC_HandleTypeDef  hadc3 = { .id = 3 };
+TIM_HandleTypeDef  htim3 = { .id = 3 };
 
 /* ========================= Spy log ================================ */
 SpyRecord spy_log[SPY_MAX_RECORDS];
@@ -223,4 +224,41 @@ uint8_t ADS7830_Measure_SingleEnded(ADC_HandleTypeDef *hadc, uint8_t channel)
         .extra = hadc
     });
     return 100;
+}
+
+/* ========================= TIM PWM stubs ========================== */
+
+HAL_StatusTypeDef HAL_TIM_PWM_Start(TIM_HandleTypeDef *htim, uint32_t Channel)
+{
+    spy_push((SpyRecord){
+        .type  = SPY_TIM_PWM_START,
+        .port  = NULL,
+        .pin   = (uint16_t)Channel,
+        .value = htim->id,
+        .extra = htim
+    });
+    return HAL_OK;
+}
+
+HAL_StatusTypeDef HAL_TIM_PWM_Stop(TIM_HandleTypeDef *htim, uint32_t Channel)
+{
+    spy_push((SpyRecord){
+        .type  = SPY_TIM_PWM_STOP,
+        .port  = NULL,
+        .pin   = (uint16_t)Channel,
+        .value = htim->id,
+        .extra = htim
+    });
+    return HAL_OK;
+}
+
+void mock_tim_set_compare(TIM_HandleTypeDef *htim, uint32_t Channel, uint32_t Compare)
+{
+    spy_push((SpyRecord){
+        .type  = SPY_TIM_SET_COMPARE,
+        .port  = NULL,
+        .pin   = (uint16_t)Channel,
+        .value = Compare,
+        .extra = htim
+    });
 }

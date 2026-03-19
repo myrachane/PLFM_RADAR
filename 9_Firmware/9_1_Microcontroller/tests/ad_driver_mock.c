@@ -7,6 +7,7 @@
 
 /* Configurable return values */
 int mock_adf4382_init_retval = 0;
+int mock_adf4382_set_timed_sync_retval = 0;
 int mock_ad9523_setup_retval = 0;
 
 /* Internal device stubs (allocated on the heap by mock init) */
@@ -73,7 +74,7 @@ int adf4382_set_en_chan(struct adf4382_dev *dev, uint8_t ch, bool en)
 int adf4382_set_timed_sync_setup(struct adf4382_dev *dev, bool sync)
 {
     spy_push_drv(SPY_ADF4382_SET_TIMED_SYNC, dev, (uint32_t)sync);
-    return 0;
+    return mock_adf4382_set_timed_sync_retval;
 }
 
 int adf4382_set_ezsync_setup(struct adf4382_dev *dev, bool sync)

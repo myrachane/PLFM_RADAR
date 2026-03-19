@@ -1,97 +1,103 @@
 /*******************************************************************************
  * test_bug3_timed_sync_noop.c
  *
- * Bug #3: ADF4382A_TriggerTimedSync() (lines 282-303) is a no-op — it only
- * prints messages but performs NO hardware action (no register writes, no GPIO
- * pulses, no SPI transactions).
+ * Bug #3 (FIXED): ADF4382A_TriggerTimedSync() was a no-op — it only printed
+ * messages but performed no hardware action.
  *
- * Test strategy:
- *   1. Initialize manager with SYNC_METHOD_TIMED, manually fix the sync setup
- *      (call SetupTimedSync after init so it actually works).
- *   2. Reset spy log.
- *   3. Call ADF4382A_TriggerTimedSync().
- *   4. Verify it returns OK.
- *   5. Count all hardware-related spy records (GPIO writes, SPI writes,
- *      ADF4382 driver calls). Expect ZERO.
- *   6. Compare with ADF4382A_TriggerEZSync() which actually does 4 SPI calls
- *      (set_sw_sync true/false for TX and RX).
+ * Fix: Implemented a sw_sync pulse (set true → 10us delay → set false) on
+ * both TX and RX devices, mirroring EZSync's trigger pattern. With
+ * timed_sync_setup already programmed, the devices synchronize their output
+ * dividers to the SYNCP/SYNCN clock edge when sw_sync is asserted.
+ *
+ * Test strategy (post-fix):
+ *   1. Initialize manager with SYNC_METHOD_TIMED.
+ *   2. Reset spy log, call TriggerTimedSync().
+ *   3. Verify 4 SPY_ADF4382_SET_SW_SYNC records (TX set, RX set, TX clear,
+ *      RX clear) — same count as EZSync.
+ *   4. Verify the set/clear ordering is correct.
  ******************************************************************************/
 #include "adf4382a_manager.h"
 #include <assert.h>
 #include <stdio.h>
-
-/* Count all hardware-action spy records (everything except tick/delay reads) */
-static int count_hardware_actions(void)
-{
-    int hw_count = 0;
-    for (int i = 0; i < spy_count; i++) {
-        const SpyRecord *r = spy_get(i);
-        if (!r) continue;
-        switch (r->type) {
-            case SPY_GPIO_WRITE:
-            case SPY_GPIO_TOGGLE:
-            case SPY_ADF4382_SET_TIMED_SYNC:
-            case SPY_ADF4382_SET_EZSYNC:
-            case SPY_ADF4382_SET_SW_SYNC:
-            case SPY_ADF4382_SPI_READ:
-            case SPY_ADF4382_SET_OUT_POWER:
-            case SPY_ADF4382_SET_EN_CHAN:
-            case SPY_AD9523_SETUP:
-            case SPY_AD9523_SYNC:
-                hw_count++;
-                break;
-            default:
-                break;
-        }
-    }
-    return hw_count;
-}
 
 int main(void)
 {
     ADF4382A_Manager mgr;
     int ret;
 
-    printf("=== Bug #3: TriggerTimedSync is a no-op ===\n");
+    printf("=== Bug #3 (FIXED): TriggerTimedSync now issues hw actions ===\n");
 
-    /* Setup: init the manager, then manually fix sync (workaround Bug #1) */
+    /* Setup: init the manager with timed sync */
     spy_reset();
     ret = ADF4382A_Manager_Init(&mgr, SYNC_METHOD_TIMED);
     assert(ret == ADF4382A_MANAGER_OK);
 
-    /* Manually call SetupTimedSync now that initialized==true */
-    ret = ADF4382A_SetupTimedSync(&mgr);
-    assert(ret == ADF4382A_MANAGER_OK);
-
-    /* ---- Test A: TriggerTimedSync produces zero hardware actions ---- */
-    spy_reset();  /* Clear all prior spy records */
+    /* ---- Test A: TriggerTimedSync produces 4 sw_sync calls ---- */
+    spy_reset();
     ret = ADF4382A_TriggerTimedSync(&mgr);
     printf("  TriggerTimedSync returned: %d (expected 0=OK)\n", ret);
     assert(ret == ADF4382A_MANAGER_OK);
 
-    int hw_actions = count_hardware_actions();
-    printf("  Hardware action spy records: %d (expected 0)\n", hw_actions);
-    assert(hw_actions == 0);
-    printf("  PASS: TriggerTimedSync does absolutely nothing to hardware\n");
+    int sw_sync_count = spy_count_type(SPY_ADF4382_SET_SW_SYNC);
+    printf("  SPY_ADF4382_SET_SW_SYNC records: %d (expected 4)\n", sw_sync_count);
+    assert(sw_sync_count == 4);
+    printf("  PASS: TriggerTimedSync issues 4 SPI sw_sync calls\n");
 
-    /* ---- Test B: For comparison, TriggerEZSync DOES hardware actions ---- */
-    /* Reconfigure to EZSYNC for comparison */
+    /* ---- Test B: Verify ordering: set(TX), set(RX), clear(TX), clear(RX) ---- */
+    printf("\n  Checking sw_sync call ordering:\n");
+    int sw_idx = 0;
+    for (int i = 0; i < spy_count; i++) {
+        const SpyRecord *r = spy_get(i);
+        if (!r || r->type != SPY_ADF4382_SET_SW_SYNC) continue;
+
+        printf("    sw_sync[%d]: dev=%s value=%d", sw_idx,
+               (r->extra == (void *)mgr.tx_dev) ? "TX" : "RX",
+               r->value);
+
+        switch (sw_idx) {
+            case 0:  /* TX set */
+                assert(r->extra == (void *)mgr.tx_dev);
+                assert(r->value == 1);
+                printf("  OK (TX set)\n");
+                break;
+            case 1:  /* RX set */
+                assert(r->extra == (void *)mgr.rx_dev);
+                assert(r->value == 1);
+                printf("  OK (RX set)\n");
+                break;
+            case 2:  /* TX clear */
+                assert(r->extra == (void *)mgr.tx_dev);
+                assert(r->value == 0);
+                printf("  OK (TX clear)\n");
+                break;
+            case 3:  /* RX clear */
+                assert(r->extra == (void *)mgr.rx_dev);
+                assert(r->value == 0);
+                printf("  OK (RX clear)\n");
+                break;
+            default:
+                assert(0 && "Unexpected extra sw_sync call");
+        }
+        sw_idx++;
+    }
+    assert(sw_idx == 4);
+    printf("  PASS: Ordering is correct (set TX, set RX, clear TX, clear RX)\n");
+
+    /* ---- Test C: Compare with EZSync — both should produce 4 sw_sync calls ---- */
     mgr.sync_method = SYNC_METHOD_EZSYNC;
     spy_reset();
     ret = ADF4382A_TriggerEZSync(&mgr);
-    printf("  TriggerEZSync returned: %d (expected 0=OK)\n", ret);
     assert(ret == ADF4382A_MANAGER_OK);
-
-    int ezsync_sw_sync_count = spy_count_type(SPY_ADF4382_SET_SW_SYNC);
-    printf("  SPY_ADF4382_SET_SW_SYNC records from EZSync: %d (expected 4)\n",
-           ezsync_sw_sync_count);
-    assert(ezsync_sw_sync_count == 4);  /* TX set, RX set, TX clear, RX clear */
-    printf("  PASS: EZSync performs 4 SPI calls, TimedSync performs 0\n");
+    int ezsync_count = spy_count_type(SPY_ADF4382_SET_SW_SYNC);
+    printf("\n  EZSync sw_sync count: %d (expected 4, same as timed sync)\n",
+           ezsync_count);
+    assert(ezsync_count == 4);
+    printf("  PASS: Both sync methods now issue the same hw trigger pattern\n");
 
     /* Cleanup */
-    mgr.sync_method = SYNC_METHOD_TIMED;  /* restore for deinit */
+    mgr.sync_method = SYNC_METHOD_TIMED;
     ADF4382A_Manager_Deinit(&mgr);
 
-    printf("=== Bug #3: ALL TESTS PASSED ===\n\n");
+    printf("\n=== Bug #3: ALL TESTS PASSED (post-fix) ===\n\n");
     return 0;
 }
