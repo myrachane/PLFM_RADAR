@@ -62,9 +62,16 @@ BUFIO bufio_dco (
     .O(adc_dco_bufio)
 );
 
-BUFG bufg_dco (
-    .I(adc_dco),
-    .O(adc_dco_buffered)
+// MMCME2 jitter-cleaning wrapper replaces the direct BUFG.
+// The PLL feedback loop attenuates input jitter from ~50 ps to ~20-30 ps,
+// reducing clock uncertainty and improving WNS on the 400 MHz CIC path.
+wire mmcm_locked;
+
+adc_clk_mmcm mmcm_inst (
+    .clk_in       (adc_dco),          // 400 MHz from IBUFDS output
+    .reset_n      (reset_n),
+    .clk_400m_out (adc_dco_buffered), // Jitter-cleaned 400 MHz on BUFG
+    .mmcm_locked  (mmcm_locked)
 );
 assign adc_dco_bufg = adc_dco_buffered;
 
@@ -117,12 +124,16 @@ reg dco_phase;
 // is asynchronous and safe — the FFs enter reset instantly.  De-assertion
 // (going high) must be synchronised to adc_dco_buffered to avoid
 // metastability.  This is the classic "async assert, sync de-assert" pattern.
+//
+// mmcm_locked gates de-assertion: the 400 MHz domain stays in reset until
+// the MMCM PLL has locked and the jitter-cleaned clock is stable.
 (* ASYNC_REG = "TRUE" *) reg [1:0] reset_sync_400m;
 wire reset_n_400m;
+wire reset_n_gated = reset_n & mmcm_locked;
 
-always @(posedge adc_dco_buffered or negedge reset_n) begin
-    if (!reset_n)
-        reset_sync_400m <= 2'b00;           // async assert
+always @(posedge adc_dco_buffered or negedge reset_n_gated) begin
+    if (!reset_n_gated)
+        reset_sync_400m <= 2'b00;           // async assert (or MMCM not locked)
     else
         reset_sync_400m <= {reset_sync_400m[0], 1'b1};  // sync de-assert
 end

@@ -45,6 +45,61 @@ wire [ACC_WIDTH-1:0] data_in_c = {{(ACC_WIDTH-18){data_in[17]}}, data_in};
 wire [47:0] pcout_0, pcout_1, pcout_2, pcout_3;
 wire [47:0] p_out_0, p_out_1, p_out_2, p_out_3, p_out_4;
 
+// Comb stage 0 DSP48E1 output wire (CREG+AREG+BREG pipelined subtract)
+wire [47:0] comb_0_p_out;
+
+// ============================================================================
+// SHARED REGISTER DECLARATIONS
+// ============================================================================
+// These registers are referenced by both the synthesis DSP48E1 instances
+// (inside `ifndef SIMULATION) and the behavioral simulation model (inside
+// `else), as well as the shared fabric logic (after `endif).
+// Icarus Verilog 13.0 requires registers to be declared before their first
+// use within any `ifdef branch, so we declare them here — before the
+// `ifndef SIMULATION block — rather than in the post-`endif shared section.
+// ============================================================================
+(* keep = "true", dont_touch = "true" *) reg signed [COMB_WIDTH-1:0] integrator_sampled;
+(* keep = "true", dont_touch = "true", max_fanout = 1 *) reg signed [COMB_WIDTH-1:0] integrator_sampled_comb;
+(* use_dsp = "yes" *) reg signed [COMB_WIDTH-1:0] comb [0:STAGES-1];
+reg signed [COMB_WIDTH-1:0] comb_delay [0:STAGES-1][0:COMB_DELAY-1];
+
+// Pipeline valid for comb stages 1-4: delayed by 1 cycle vs comb_pipe to
+// account for CREG+AREG+BREG pipeline inside comb_0_dsp (explicit DSP48E1).
+// Comb[0] result appears 1 cycle after data_valid_comb_pipe.
+(* keep = "true", max_fanout = 4 *) reg data_valid_comb_0_out;
+
+// Enhanced control and monitoring
+reg [1:0] decimation_counter;
+(* keep = "true", max_fanout = 4 *) reg data_valid_delayed;
+(* keep = "true", max_fanout = 4 *) reg data_valid_comb;
+(* keep = "true", max_fanout = 4 *) reg data_valid_comb_pipe;
+reg [7:0] output_counter;
+reg [ACC_WIDTH-1:0] max_integrator_value;
+reg overflow_detected;
+reg overflow_latched;
+
+// Diagnostic registers
+reg [7:0] saturation_event_count;
+reg [31:0] sample_count;
+
+// Comb-stage saturation flags
+reg comb_overflow_latched;
+reg comb_saturation_detected;
+reg [7:0] comb_saturation_event_count;
+
+// Temporary signals for calculations
+reg signed [ACC_WIDTH-1:0] abs_integrator_value;
+reg signed [COMB_WIDTH-1:0] temp_scaled_output;
+reg signed [17:0] temp_output;
+
+// Pipeline stage for saturation comparison
+reg sat_pos;
+reg sat_neg;
+reg signed [17:0] temp_output_pipe;
+reg data_out_valid_pipe;
+
+integer i, j;
+
 `ifndef SIMULATION
 // ============================================================================
 // SYNTHESIS: Explicit DSP48E1 instances with PCOUT→PCIN cascade
@@ -426,6 +481,111 @@ DSP48E1 #(
     .UNDERFLOW          ()
 );
 
+// ============================================================================
+// COMB STAGE 0 — Explicit DSP48E1 with CREG=1 for Critical Path Fix
+// ============================================================================
+// Build 18 critical path: integrator_sampled_comb_reg → comb_reg[0]/C[38]
+//   WNS = +0.062 ns, data path = 1.022 ns (0.379 logic + 0.643 route)
+//
+// By enabling CREG=1 (+ AREG=1, BREG=1), the fabric register
+// integrator_sampled_comb is absorbed into the DSP48's internal C pipeline
+// register, eliminating the 0.643 ns fabric→DSP routing delay entirely.
+// The DSP48 performs: P = C_reg - {A_reg, B_reg}  (i.e., subtract)
+//
+// Latency: +1 cycle vs. the old inferred comb[0]. This is accounted for
+// by the data_valid_comb_0_out signal, which delays the valid for stages 1-4.
+//
+// C-port = sign-extended integrator_sampled_comb (28→48 bits)
+// A:B    = sign-extended comb_delay[0][0] (28→48 bits)
+// OPMODE = 7'b0110011: Z=C(011), Y=0(00), X=A:B(11)
+// ALUMODE= 4'b0011:    Z - (X + Y + CIN) = C - A:B
+//
+// The comb_delay[0][0] register stays in fabric (captures
+// integrator_sampled_comb at the same time as the C register, unchanged).
+// Comb stages 1-4 remain inferred with (* use_dsp = "yes" *).
+
+// Sign-extended inputs for comb_0 DSP48E1
+wire [47:0] comb_0_c_in = {{(48-COMB_WIDTH){integrator_sampled_comb[COMB_WIDTH-1]}},
+                            integrator_sampled_comb};
+wire [47:0] comb_0_ab_in = {{(48-COMB_WIDTH){comb_delay[0][COMB_DELAY-1][COMB_WIDTH-1]}},
+                             comb_delay[0][COMB_DELAY-1]};
+
+DSP48E1 #(
+    .A_INPUT            ("DIRECT"),
+    .B_INPUT            ("DIRECT"),
+    .USE_DPORT          ("FALSE"),
+    .USE_MULT           ("NONE"),
+    .AUTORESET_PATDET   ("NO_RESET"),
+    .MASK               (48'h3FFFFFFFFFFF),
+    .PATTERN             (48'h000000000000),
+    .SEL_MASK           ("MASK"),
+    .SEL_PATTERN        ("PATTERN"),
+    .USE_PATTERN_DETECT ("NO_PATDET"),
+    .ACASCREG           (1),       // A cascade register matches AREG
+    .ADREG              (0),
+    .ALUMODEREG         (0),
+    .AREG               (1),       // A-port registered — eliminates fabric routing
+    .BCASCREG           (1),       // B cascade register matches BREG
+    .BREG               (1),       // B-port registered — eliminates fabric routing
+    .CARRYINREG         (0),
+    .CARRYINSELREG      (0),
+    .CREG               (1),       // *** KEY: C-port registered inside DSP48 ***
+                                   // Absorbs integrator_sampled_comb FDRE, eliminates
+                                   // 0.643 ns fabric→DSP C-port routing delay.
+    .DREG               (0),
+    .INMODEREG          (0),
+    .MREG               (0),
+    .OPMODEREG          (0),
+    .PREG               (1)        // P register enabled (output pipeline)
+) comb_0_dsp (
+    .CLK                (clk),
+    // A:B = sign-extended comb_delay[0][last] (subtrahend)
+    .A                  (comb_0_ab_in[47:18]),   // Upper 30 bits
+    .B                  (comb_0_ab_in[17:0]),    // Lower 18 bits
+    .C                  (comb_0_c_in),           // integrator_sampled_comb (minuend)
+    .D                  (25'd0),
+    .CARRYIN            (1'b0),
+    .CARRYINSEL         (3'b000),
+    .OPMODE             (7'b0110011),  // Z=C, Y=0, X=A:B → ALU input = C, A:B
+    .ALUMODE            (4'b0011),     // Z - (X+Y+CIN) = C - A:B
+    .INMODE             (5'b00000),
+    .CEA1               (1'b0),
+    .CEA2               (data_valid_comb_pipe),  // Load A register when valid
+    .CEB1               (1'b0),
+    .CEB2               (data_valid_comb_pipe),  // Load B register when valid
+    .CEC                (data_valid_comb_pipe),  // Load C register when valid
+    .CED                (1'b0),
+    .CEM                (1'b0),
+    .CEP                (1'b1),        // Always propagate — P updates 1 cycle after
+                                       // input registers are loaded
+    .CEAD               (1'b0),
+    .CEALUMODE          (1'b0),
+    .CECTRL             (1'b0),
+    .CECARRYIN          (1'b0),
+    .CEINMODE           (1'b0),
+    .RSTP               (reset_h),
+    .RSTA               (reset_h),
+    .RSTB               (reset_h),
+    .RSTC               (reset_h),
+    .RSTD               (1'b0),
+    .RSTM               (1'b0),
+    .RSTALLCARRYIN      (1'b0),
+    .RSTALUMODE         (1'b0),
+    .RSTCTRL            (1'b0),
+    .RSTINMODE          (1'b0),
+    .P                  (comb_0_p_out),
+    .PCOUT              (),
+    .ACOUT              (),
+    .BCOUT              (),
+    .CARRYCASCOUT       (),
+    .CARRYOUT           (),
+    .MULTSIGNOUT        (),
+    .OVERFLOW           (),
+    .PATTERNBDETECT     (),
+    .PATTERNDETECT      (),
+    .UNDERFLOW          ()
+);
+
 `else
 // ============================================================================
 // SIMULATION: Behavioral model (Icarus Verilog compatible)
@@ -441,6 +601,14 @@ DSP48E1 #(
 reg signed [ACC_WIDTH-1:0] sim_int_0, sim_int_1, sim_int_2, sim_int_3, sim_int_4;
 reg signed [ACC_WIDTH-1:0] data_in_c_delayed;  // Models CREG=1 on integrator_0
 
+// Comb_0 DSP48E1 behavioral model (models CREG+AREG+BREG+PREG pipeline)
+// In simulation there is no DSP48E1 primitive, so we model the 4-stage pipe:
+//   Stage 1 (CREG/AREG/BREG): capture C and A:B inputs (on data_valid_comb_pipe)
+//   Stage 2 (PREG): P = C_reg - AB_reg (always, like CEP=1 in synthesis)
+reg signed [COMB_WIDTH-1:0] sim_comb_0_c_reg;   // Models CREG
+reg signed [COMB_WIDTH-1:0] sim_comb_0_ab_reg;  // Models AREG+BREG (combined)
+reg signed [47:0] sim_comb_0_p_reg;              // Models PREG
+
 always @(posedge clk) begin
     if (reset_h) begin
         sim_int_0 <= 0;
@@ -449,16 +617,32 @@ always @(posedge clk) begin
         sim_int_3 <= 0;
         sim_int_4 <= 0;
         data_in_c_delayed <= 0;
-    end else if (data_valid) begin
-        // CREG pipeline: capture current data, use previous
-        data_in_c_delayed <= $signed(data_in_c);
-        sim_int_0 <= sim_int_0 + data_in_c_delayed;
-        sim_int_1 <= sim_int_1 + sim_int_0;
-        sim_int_2 <= sim_int_2 + sim_int_1;
-        sim_int_3 <= sim_int_3 + sim_int_2;
-        sim_int_4 <= sim_int_4 + sim_int_3;
+        sim_comb_0_c_reg <= 0;
+        sim_comb_0_ab_reg <= 0;
+        sim_comb_0_p_reg <= 0;
+    end else begin
+        if (data_valid) begin
+            // CREG pipeline: capture current data, use previous
+            data_in_c_delayed <= $signed(data_in_c);
+            sim_int_0 <= sim_int_0 + data_in_c_delayed;
+            sim_int_1 <= sim_int_1 + sim_int_0;
+            sim_int_2 <= sim_int_2 + sim_int_1;
+            sim_int_3 <= sim_int_3 + sim_int_2;
+            sim_int_4 <= sim_int_4 + sim_int_3;
+        end
+        // Comb_0 DSP48 behavioral model:
+        // CREG/AREG/BREG load on data_valid_comb_pipe (like CEC/CEA2/CEB2)
+        if (data_valid_comb_pipe) begin
+            sim_comb_0_c_reg <= integrator_sampled_comb;
+            sim_comb_0_ab_reg <= comb_delay[0][COMB_DELAY-1];
+        end
+        // PREG always updates (CEP=1): P = C_reg - AB_reg
+        sim_comb_0_p_reg <= {{(48-COMB_WIDTH){sim_comb_0_c_reg[COMB_WIDTH-1]}}, sim_comb_0_c_reg}
+                          - {{(48-COMB_WIDTH){sim_comb_0_ab_reg[COMB_WIDTH-1]}}, sim_comb_0_ab_reg};
     end
 end
+
+assign comb_0_p_out = sim_comb_0_p_reg;
 
 assign p_out_0 = sim_int_0;
 assign p_out_1 = sim_int_1;
@@ -475,42 +659,8 @@ assign pcout_3 = sim_int_3;
 // ============================================================================
 // CONTROL AND MONITORING (fabric logic)
 // ============================================================================
-(* keep = "true", dont_touch = "true" *) reg signed [COMB_WIDTH-1:0] integrator_sampled;
-(* keep = "true", dont_touch = "true", max_fanout = 1 *) reg signed [COMB_WIDTH-1:0] integrator_sampled_comb;
-(* use_dsp = "yes" *) reg signed [COMB_WIDTH-1:0] comb [0:STAGES-1];
-reg signed [COMB_WIDTH-1:0] comb_delay [0:STAGES-1][0:COMB_DELAY-1];
-
-// Enhanced control and monitoring
-reg [1:0] decimation_counter;
-(* keep = "true", max_fanout = 4 *) reg data_valid_delayed;
-(* keep = "true", max_fanout = 4 *) reg data_valid_comb;
-(* keep = "true", max_fanout = 4 *) reg data_valid_comb_pipe;
-reg [7:0] output_counter;
-reg [ACC_WIDTH-1:0] max_integrator_value;
-reg overflow_detected;
-reg overflow_latched;
-
-// Diagnostic registers
-reg [7:0] saturation_event_count;
-reg [31:0] sample_count;
-
-// Comb-stage saturation flags
-reg comb_overflow_latched;
-reg comb_saturation_detected;
-reg [7:0] comb_saturation_event_count;
-
-// Temporary signals for calculations
-reg signed [ACC_WIDTH-1:0] abs_integrator_value;
-reg signed [COMB_WIDTH-1:0] temp_scaled_output;
-reg signed [17:0] temp_output;
-
-// Pipeline stage for saturation comparison
-reg sat_pos;
-reg sat_neg;
-reg signed [17:0] temp_output_pipe;
-reg data_out_valid_pipe;
-
-integer i, j;
+// (Register declarations moved above `ifndef SIMULATION for Icarus Verilog
+//  forward-reference compatibility — see "SHARED REGISTER DECLARATIONS".)
 
 // Initialize
 initial begin
@@ -525,6 +675,7 @@ initial begin
     data_valid_delayed = 0;
     data_valid_comb = 0;
     data_valid_comb_pipe = 0;
+    data_valid_comb_0_out = 0;
     output_counter = 0;
     max_integrator_value = 0;
     overflow_detected = 0;
@@ -609,10 +760,16 @@ always @(posedge clk) begin
     if (!reset_n) begin
         data_valid_comb <= 0;
         data_valid_comb_pipe <= 0;
+        data_valid_comb_0_out <= 0;
         integrator_sampled_comb <= 0;
     end else begin
         data_valid_comb <= data_valid_delayed;
         data_valid_comb_pipe <= data_valid_comb;
+        // data_valid_comb_0_out is delayed 1 cycle from data_valid_comb_pipe
+        // to account for CREG+AREG+BREG pipeline in comb_0_dsp.
+        // When data_valid_comb_0_out fires, comb_0_p_out (DSP48 PREG)
+        // contains the valid comb[0] result.
+        data_valid_comb_0_out <= data_valid_comb_pipe;
         integrator_sampled_comb <= integrator_sampled;
     end
 end
@@ -625,11 +782,14 @@ end
 // WNS = +0.128ns). DSP48E1 ALU performs 48-bit add/subtract in a single
 // cycle with zero fabric logic, targeting WNS > +1.0ns.
 //
-// The (* use_dsp = "yes" *) attribute on comb[] tells Vivado synthesis to
-// map the subtract into DSP48E1 P = C - A:B (ALUMODE=4'b0011). Each comb
-// stage becomes one DSP48E1 with PREG=1, completely eliminating the CARRY4
-// chain from fabric. With 5 stages × 2 channels (I/Q) = 10 additional
-// DSP48E1s, total DSP usage rises from 130 to ~140 out of 740 (18.9%).
+// COMB STAGE 0: Explicit DSP48E1 with CREG=1 (comb_0_dsp instance above).
+//   - comb[0] is driven by comb_0_p_out[COMB_WIDTH-1:0] (DSP48 P register)
+//   - comb_delay[0][0] still captures integrator_sampled_comb in fabric
+//   - Valid signal for stages 1-4 is data_valid_comb_0_out (delayed by 1 cycle
+//     from data_valid_comb_pipe to match CREG+AREG+BREG pipeline latency)
+//
+// COMB STAGES 1-4: Inferred DSP48E1 via (* use_dsp = "yes" *) attribute.
+//   - Each stage: comb[i] = comb[i-1] - comb_delay[i][last]
 
 always @(posedge clk) begin
     if (!reset_n) begin
@@ -657,21 +817,34 @@ always @(posedge clk) begin
             comb_saturation_event_count <= 0;
         end
 
+        // ---- Comb Stage 0: delay line update + DSP48 output capture ----
+        // comb_delay[0][0] captures integrator_sampled_comb on the SAME cycle
+        // as the DSP48 input registers (CREG/AREG/BREG), so they see the
+        // same value. The DSP48 PREG output appears 1 cycle later.
         if (data_valid_comb_pipe) begin
-            for (i = 0; i < STAGES; i = i + 1) begin
-                if (i == 0) begin
-                    comb[0] <= integrator_sampled_comb - comb_delay[0][COMB_DELAY-1];
-                    for (j = COMB_DELAY-1; j > 0; j = j - 1) begin
-                        comb_delay[0][j] <= comb_delay[0][j-1];
-                    end
-                    comb_delay[0][0] <= integrator_sampled_comb;
-                end else begin
-                    comb[i] <= comb[i-1] - comb_delay[i][COMB_DELAY-1];
-                    for (j = COMB_DELAY-1; j > 0; j = j - 1) begin
-                        comb_delay[i][j] <= comb_delay[i][j-1];
-                    end
-                    comb_delay[i][0] <= comb[i-1];
+            for (j = COMB_DELAY-1; j > 0; j = j - 1) begin
+                comb_delay[0][j] <= comb_delay[0][j-1];
+            end
+            comb_delay[0][0] <= integrator_sampled_comb;
+        end
+
+        // ---- Comb Stage 0 result: from explicit DSP48E1 ----
+        // comb_0_dsp PREG output is valid 1 cycle after data_valid_comb_pipe.
+        // We capture it into comb[0] on data_valid_comb_0_out so comb stages
+        // 1-4 can read it.
+        if (data_valid_comb_0_out) begin
+            comb[0] <= comb_0_p_out[COMB_WIDTH-1:0];
+        end
+
+        // ---- Comb Stages 1-4: inferred DSP48E1 subtracts ----
+        // These fire on data_valid_comb_0_out (when comb[0] is valid).
+        if (data_valid_comb_0_out) begin
+            for (i = 1; i < STAGES; i = i + 1) begin
+                comb[i] <= comb[i-1] - comb_delay[i][COMB_DELAY-1];
+                for (j = COMB_DELAY-1; j > 0; j = j - 1) begin
+                    comb_delay[i][j] <= comb_delay[i][j-1];
                 end
+                comb_delay[i][0] <= comb[i-1];
             end
 
             // Gain = (4^5) = 1024 = 2^10, scale by 2^10 to normalize
