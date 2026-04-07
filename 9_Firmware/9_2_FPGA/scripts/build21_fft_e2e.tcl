@@ -196,7 +196,7 @@ set impl_status [get_property STATUS [get_runs impl_1]]
 puts "  Implementation status: $impl_status"
 puts "  Implementation time:   ${impl_elapsed}s ([expr {$impl_elapsed/60}]m [expr {$impl_elapsed%60}]s)"
 
-if {![string match "*Complete*" $impl_status]} {
+if {![string match "*Complete*" $impl_status] && ![string match "*write_bitstream*" $impl_status]} {
     puts "CRITICAL: IMPLEMENTATION FAILED: $impl_status"
     close_project
     exit 1
@@ -212,7 +212,10 @@ puts "  Phase 3/5: Bitstream Generation"
 puts "================================================================"
 
 set bit_start [clock seconds]
-launch_runs impl_1 -to_step write_bitstream -jobs 8
+# Handle case where Vivado auto-proceeds to write_bitstream after impl
+if {[catch {launch_runs impl_1 -to_step write_bitstream -jobs 8} launch_err]} {
+    puts "  Note: write_bitstream may already be in progress: $launch_err"
+}
 wait_on_run impl_1
 set bit_elapsed [expr {[clock seconds] - $bit_start}]
 puts "  Bitstream time: ${bit_elapsed}s"
@@ -302,7 +305,7 @@ report_cdc -details -file "${report_dir}/12_cdc.rpt"
 puts "  [13/15] Log scan — see build21.log"
 
 # --- Additional reports ---
-puts "  [extra] Generating additional diagnostic reports..."
+puts "  \[extra\] Generating additional diagnostic reports..."
 
 # report_exceptions can fail in Vivado 2025.2 — wrap in catch
 if {[catch {report_exceptions -file "${report_dir}/13_exceptions.rpt"} err]} {
