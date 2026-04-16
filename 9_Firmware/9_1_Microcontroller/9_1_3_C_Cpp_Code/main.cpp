@@ -2180,9 +2180,24 @@ int main(void)
 
       runRadarPulseSequence();
 
-      /* [AGC] Outer-loop AGC: read FPGA saturation flag (DIG_5 / PD13),
-       * adjust ADAR1000 VGA common gain once per radar frame (~258 ms).
-       * Only run when AGC is enabled — otherwise leave VGA gains untouched. */
+      /* [AGC] Outer-loop AGC: sync enable from FPGA via DIG_6 (PD14),
+       * then read saturation flag (DIG_5 / PD13) and adjust ADAR1000 VGA
+       * common gain once per radar frame (~258 ms).
+       * FPGA register host_agc_enable is the single source of truth —
+       * DIG_6 propagates it to MCU every frame.
+       * 2-frame confirmation debounce: only change outerAgc.enabled when
+       * two consecutive frames read the same DIG_6 value. Prevents a
+       * single-sample glitch from causing a spurious AGC state transition.
+       * Added latency: 1 extra frame (~258 ms), acceptable for control plane. */
+      {
+          bool dig6_now = (HAL_GPIO_ReadPin(FPGA_DIG6_GPIO_Port,
+                                            FPGA_DIG6_Pin) == GPIO_PIN_SET);
+          static bool dig6_prev = false;  // matches boot default (AGC off)
+          if (dig6_now == dig6_prev) {
+              outerAgc.enabled = dig6_now;
+          }
+          dig6_prev = dig6_now;
+      }
       if (outerAgc.enabled) {
           bool sat = HAL_GPIO_ReadPin(FPGA_DIG5_SAT_GPIO_Port,
                                       FPGA_DIG5_SAT_Pin) == GPIO_PIN_SET;

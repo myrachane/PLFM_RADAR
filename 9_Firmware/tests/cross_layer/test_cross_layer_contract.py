@@ -27,6 +27,7 @@ layers agree (because both could be wrong).
 from __future__ import annotations
 
 import os
+import re
 import struct
 import subprocess
 import tempfile
@@ -367,6 +368,188 @@ class TestTier1ResetDefaults:
             assert actual == expected, (
                 f"{reg}: reset default {actual} != expected {expected}"
             )
+
+
+class TestTier1AgcCrossLayerInvariant:
+    """
+    Verify AGC enable/disable is consistent across FPGA, MCU, and GUI layers.
+
+    System-level invariant: the FPGA register host_agc_enable is the single
+    source of truth for AGC state. It propagates to MCU via DIG_6 GPIO and
+    to GUI via status word 4 bit[11]. At boot, all layers must agree AGC=OFF.
+    At runtime, the MCU must read DIG_6 every frame to sync its outer-loop AGC.
+    """
+
+    def test_fpga_dig6_drives_agc_enable(self):
+        """FPGA must drive gpio_dig6 from host_agc_enable, NOT tied low."""
+        rtl = (cp.FPGA_DIR / "radar_system_top.v").read_text()
+        # Must find: assign gpio_dig6 = host_agc_enable;
+        assert re.search(
+            r'assign\s+gpio_dig6\s*=\s*host_agc_enable\s*;', rtl
+        ), "gpio_dig6 must be driven by host_agc_enable (not tied low)"
+        # Must NOT have the old tied-low pattern
+        assert not re.search(
+            r"assign\s+gpio_dig6\s*=\s*1'b0\s*;", rtl
+        ), "gpio_dig6 must NOT be tied low — it carries AGC enable"
+
+    def test_fpga_agc_enable_boot_default_off(self):
+        """FPGA host_agc_enable must reset to 0 (AGC off at boot)."""
+        v_defaults = cp.parse_verilog_reset_defaults()
+        assert "host_agc_enable" in v_defaults, (
+            "host_agc_enable not found in reset block"
+        )
+        assert v_defaults["host_agc_enable"] == 0, (
+            f"host_agc_enable reset default is {v_defaults['host_agc_enable']}, "
+            "expected 0 (AGC off at boot)"
+        )
+
+    def test_mcu_agc_constructor_default_off(self):
+        """MCU ADAR1000_AGC constructor must default enabled=false."""
+        agc_cpp = (cp.MCU_LIB_DIR / "ADAR1000_AGC.cpp").read_text()
+        # The constructor initializer list must have enabled(false)
+        assert re.search(
+            r'enabled\s*\(\s*false\s*\)', agc_cpp
+        ), "ADAR1000_AGC constructor must initialize enabled(false)"
+        assert not re.search(
+            r'enabled\s*\(\s*true\s*\)', agc_cpp
+        ), "ADAR1000_AGC constructor must NOT initialize enabled(true)"
+
+    def test_mcu_reads_dig6_before_agc_gate(self):
+        """MCU main loop must read DIG_6 GPIO to sync outerAgc.enabled."""
+        main_cpp = (cp.MCU_CODE_DIR / "main.cpp").read_text()
+        # DIG_6 must be read via HAL_GPIO_ReadPin
+        assert re.search(
+            r'HAL_GPIO_ReadPin\s*\(\s*FPGA_DIG6', main_cpp,
+        ), "main.cpp must read DIG_6 GPIO via HAL_GPIO_ReadPin"
+        # outerAgc.enabled must be assigned from the DIG_6 reading
+        # (may be indirect via debounce variable like dig6_now)
+        assert re.search(
+            r'outerAgc\.enabled\s*=', main_cpp,
+        ), "main.cpp must assign outerAgc.enabled from DIG_6 state"
+
+    def test_boot_invariant_all_layers_agc_off(self):
+        """
+        At boot, all three layers must agree: AGC is OFF.
+        - FPGA: host_agc_enable resets to 0 -> DIG_6 low
+        - MCU: ADAR1000_AGC.enabled defaults to false
+        - GUI: reads status word 4 bit[11] = 0 -> reports MANUAL
+        """
+        # FPGA
+        v_defaults = cp.parse_verilog_reset_defaults()
+        assert v_defaults.get("host_agc_enable") == 0
+
+        # MCU
+        agc_cpp = (cp.MCU_LIB_DIR / "ADAR1000_AGC.cpp").read_text()
+        assert re.search(r'enabled\s*\(\s*false\s*\)', agc_cpp)
+
+        # GUI: status word 4 bit[11] is host_agc_enable, which resets to 0.
+        # Verify the GUI parses bit[11] of status word 4 as the AGC flag.
+        gui_py = (cp.GUI_DIR / "radar_protocol.py").read_text()
+        assert re.search(
+            r'words\[4\].*>>\s*11|status_words\[4\].*>>\s*11',
+            gui_py,
+        ), "GUI must parse AGC status from words[4] bit[11]"
+
+    def test_status_word4_agc_bit_matches_dig6_source(self):
+        """
+        Status word 4 bit[11] and DIG_6 must both derive from host_agc_enable.
+        This guarantees the GUI status display can never lie about MCU AGC state.
+        """
+        rtl = (cp.FPGA_DIR / "radar_system_top.v").read_text()
+
+        # DIG_6 driven by host_agc_enable
+        assert re.search(
+            r'assign\s+gpio_dig6\s*=\s*host_agc_enable\s*;', rtl
+        )
+
+        # Status word 4 must contain host_agc_enable (may be named
+        # status_agc_enable at the USB interface port boundary).
+        # Also verify the top-level wiring connects them.
+        usb_ft2232h = (cp.FPGA_DIR / "usb_data_interface_ft2232h.v").read_text()
+        usb_ft601 = (cp.FPGA_DIR / "usb_data_interface.v").read_text()
+
+        # USB interfaces use the port name status_agc_enable
+        found_in_ft2232h = "status_agc_enable" in usb_ft2232h
+        found_in_ft601 = "status_agc_enable" in usb_ft601
+
+        assert found_in_ft2232h or found_in_ft601, (
+            "status_agc_enable must appear in at least one USB interface's "
+            "status word to guarantee GUI status matches DIG_6"
+        )
+
+        # Verify top-level wiring: status_agc_enable port is connected
+        # to host_agc_enable (same signal that drives DIG_6)
+        assert re.search(
+            r'\.status_agc_enable\s*\(\s*host_agc_enable\s*\)', rtl
+        ), (
+            "Top-level must wire .status_agc_enable(host_agc_enable) "
+            "so status word and DIG_6 derive from the same signal"
+        )
+
+    def test_mcu_dig6_debounce_guards_enable_assignment(self):
+        """
+        MCU must apply a 2-frame confirmation debounce before mutating
+        outerAgc.enabled from DIG_6 reads. A naive assignment straight from
+        the latest GPIO sample would let a single-cycle glitch flip the AGC
+        state for one frame — defeating the debounce claim in the PR body.
+        """
+        main_cpp = (cp.MCU_CODE_DIR / "main.cpp").read_text()
+
+        # (1) Current-frame DIG_6 sample must be captured in a local variable
+        # so it can be compared against the previous-frame value.
+        now_match = re.search(
+            r'(bool|int|uint8_t)\s+(\w*dig6\w*)\s*=\s*[^;]*?'
+            r'HAL_GPIO_ReadPin\s*\(\s*FPGA_DIG6[^;]*;',
+            main_cpp,
+            re.DOTALL,
+        )
+        assert now_match, (
+            "DIG_6 read must be stored in a local variable (e.g. `dig6_now`) "
+            "so the current sample can be compared against the previous frame"
+        )
+        now_var = now_match.group(2)
+
+        # (2) Previous-frame state must persist across iterations via static
+        # storage, and must default to false (matches FPGA boot: AGC off).
+        prev_match = re.search(
+            r'static\s+(bool|int|uint8_t)\s+(\w*dig6\w*)\s*=\s*(false|0)\s*;',
+            main_cpp,
+        )
+        assert prev_match, (
+            "A static previous-frame variable (e.g. "
+            "`static bool dig6_prev = false;`) must exist, initialized to "
+            "false so the debounce starts in sync with the FPGA boot default"
+        )
+        prev_var = prev_match.group(2)
+        assert prev_var != now_var, (
+            f"Current and previous DIG_6 variables must be distinct "
+            f"(both are '{now_var}')"
+        )
+
+        # (3) outerAgc.enabled assignment must be gated by now == prev.
+        guarded_assign = re.search(
+            rf'if\s*\(\s*{now_var}\s*==\s*{prev_var}\s*\)\s*\{{[^}}]*?'
+            rf'outerAgc\.enabled\s*=\s*{now_var}\s*;',
+            main_cpp,
+            re.DOTALL,
+        )
+        assert guarded_assign, (
+            f"`outerAgc.enabled = {now_var};` must be inside "
+            f"`if ({now_var} == {prev_var}) {{ ... }}` — the confirmation "
+            "guard that absorbs single-sample GPIO glitches. A naive "
+            "assignment without this guard reintroduces the glitch bug."
+        )
+
+        # (4) Previous-frame variable must advance each frame.
+        prev_update = re.search(
+            rf'{prev_var}\s*=\s*{now_var}\s*;',
+            main_cpp,
+        )
+        assert prev_update, (
+            f"`{prev_var} = {now_var};` must run each frame so the "
+            "debounce window slides forward; without it the guard is "
+            "stuck and enable changes never confirm"
+        )
 
 
 class TestTier1DataPacketLayout:

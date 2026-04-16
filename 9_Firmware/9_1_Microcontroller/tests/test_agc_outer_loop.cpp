@@ -50,7 +50,7 @@ static void test_defaults()
     assert(agc.min_gain == 0);
     assert(agc.max_gain == 127);
     assert(agc.holdoff_frames == 4);
-    assert(agc.enabled == true);
+    assert(agc.enabled == false);  // disabled by default — FPGA DIG_6 is source of truth
     assert(agc.holdoff_counter == 0);
     assert(agc.last_saturated == false);
     assert(agc.saturation_event_count == 0);
@@ -67,6 +67,7 @@ static void test_defaults()
 static void test_saturation_reduces_gain()
 {
     ADAR1000_AGC agc;
+    agc.enabled = true;  // default is OFF; enable for this test
     uint8_t initial = agc.agc_base_gain;  // 30
 
     agc.update(true);  // saturation
@@ -82,6 +83,7 @@ static void test_saturation_reduces_gain()
 static void test_holdoff_prevents_early_gain_up()
 {
     ADAR1000_AGC agc;
+    agc.enabled = true;  // default is OFF; enable for this test
     agc.update(true);  // saturate once -> gain = 26
     uint8_t after_sat = agc.agc_base_gain;
 
@@ -101,6 +103,7 @@ static void test_holdoff_prevents_early_gain_up()
 static void test_recovery_after_holdoff()
 {
     ADAR1000_AGC agc;
+    agc.enabled = true;  // default is OFF; enable for this test
     agc.update(true);  // saturate -> gain = 26
     uint8_t after_sat = agc.agc_base_gain;
 
@@ -119,6 +122,7 @@ static void test_recovery_after_holdoff()
 static void test_min_gain_clamp()
 {
     ADAR1000_AGC agc;
+    agc.enabled = true;  // default is OFF; enable for this test
     agc.min_gain = 10;
     agc.agc_base_gain = 12;
     agc.gain_step_down = 4;
@@ -136,6 +140,7 @@ static void test_min_gain_clamp()
 static void test_max_gain_clamp()
 {
     ADAR1000_AGC agc;
+    agc.enabled = true;  // default is OFF; enable for this test
     agc.max_gain = 32;
     agc.agc_base_gain = 31;
     agc.gain_step_up = 2;
@@ -226,6 +231,7 @@ static void test_apply_gain_spi()
 static void test_reset_preserves_config()
 {
     ADAR1000_AGC agc;
+    agc.enabled = true;  // default is OFF; enable for this test
     agc.agc_base_gain = 42;
     agc.gain_step_down = 8;
     agc.cal_offset[3] = -5;
@@ -255,6 +261,7 @@ static void test_reset_preserves_config()
 static void test_saturation_counter()
 {
     ADAR1000_AGC agc;
+    agc.enabled = true;  // default is OFF; enable for this test
 
     for (int i = 0; i < 10; ++i) {
         agc.update(true);
@@ -274,6 +281,7 @@ static void test_saturation_counter()
 static void test_mixed_sequence()
 {
     ADAR1000_AGC agc;
+    agc.enabled = true;  // default is OFF; enable for this test
     agc.agc_base_gain = 30;
     agc.gain_step_down = 4;
     agc.gain_step_up = 1;

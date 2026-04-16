@@ -130,7 +130,7 @@ module radar_system_top (
     // FPGA→STM32 GPIO outputs (DIG_5..DIG_7 on 50T board)
     // Used by STM32 outer AGC loop to read saturation state without USB polling.
     output wire gpio_dig5,          // DIG_5 (H11→PD13): AGC saturation flag (1=clipping detected)
-    output wire gpio_dig6,          // DIG_6 (G12→PD14): reserved (tied low)
+    output wire gpio_dig6,          // DIG_6 (G12→PD14): AGC enable flag (mirrors host_agc_enable)
     output wire gpio_dig7           // DIG_7 (H12→PD15): reserved (tied low)
 );
 
@@ -1037,9 +1037,11 @@ assign system_status = status_reg;
 // ============================================================================
 // DIG_5: AGC saturation flag — high when per-frame saturation_count > 0.
 //        STM32 reads PD13 to detect clipping and adjust ADAR1000 VGA gain.
-// DIG_6, DIG_7: Reserved (tied low for future use).
+// DIG_6: AGC enable flag — mirrors host_agc_enable so STM32 outer-loop AGC
+//        tracks the FPGA register as single source of truth.
+// DIG_7: Reserved (tied low for future use).
 assign gpio_dig5 = (rx_agc_saturation_count != 8'd0);
-assign gpio_dig6 = 1'b0;
+assign gpio_dig6 = host_agc_enable;
 assign gpio_dig7 = 1'b0;
 
 // ============================================================================

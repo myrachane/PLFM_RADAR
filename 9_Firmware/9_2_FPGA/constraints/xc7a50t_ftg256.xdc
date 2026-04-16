@@ -224,7 +224,7 @@ set_property IOSTANDARD LVCMOS33 [get_ports {stm32_mixers_enable}]
 
 # DIG_5 = H11, DIG_6 = G12, DIG_7 = H12 — FPGA→STM32 status outputs
 # DIG_5: AGC saturation flag (PD13 on STM32)
-# DIG_6: reserved (PD14)
+# DIG_6: AGC enable flag (PD14) — mirrors FPGA host_agc_enable to STM32
 # DIG_7: reserved (PD15)
 set_property PACKAGE_PIN H11 [get_ports {gpio_dig5}]
 set_property PACKAGE_PIN G12 [get_ports {gpio_dig6}]
